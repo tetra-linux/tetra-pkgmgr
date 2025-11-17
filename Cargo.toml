@@ -8,3 +8,5 @@ name = "tetra"
 path = "src/main.rs"
 
 [dependencies]
+serde = "1.0.228"
+serde_yaml = "0.9.34"
