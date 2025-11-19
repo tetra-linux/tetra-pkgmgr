@@ -1,6 +1,13 @@
 use anyhow::{Result, anyhow};
+use curl::easy::Easy;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Debug)]
 struct TetraRoot {
@@ -41,12 +48,185 @@ impl TetraRoot {
         Ok(repos)
     }
 
+    pub fn cache(&self) -> Result<Cache> {
+        let cache_dir = self.root.join("cache");
+
+        if !cache_dir.is_dir() {
+            std::fs::create_dir_all(&cache_dir)?;
+        }
+
+        Ok(Cache { cache_dir })
+    }
+
+    pub fn get_temp_dir(&self) -> Result<PathBuf> {
+        let tmp_dir = self.root.join("tmp");
+
+        if !tmp_dir.is_dir() {
+            std::fs::create_dir_all(&tmp_dir)?;
+        }
+
+        Ok(tmp_dir)
+    }
+
     pub fn get_default_arch(&self) -> String {
         let arch_file = self.root.join("arch");
         std::fs::read_to_string(arch_file)
             .unwrap_or("".to_string())
             .trim()
             .to_string()
+    }
+}
+
+#[derive(Debug)]
+struct Downloader<'a, T> {
+    source: &'a T,
+    tmp_file: TempFile,
+    name: &'a str,
+}
+
+impl<'a, T> Downloader<'a, T>
+where
+    T: Source,
+{
+    pub fn new(root: &TetraRoot, source: &'a T, name: &'a str) -> Result<Self> {
+        let tmp_file = TempFile::new(root, source.checksum()?)?;
+        Ok(Self {
+            source,
+            tmp_file,
+            name,
+        })
+    }
+
+    pub fn download(&self) -> Result<()> {
+        let pb = ProgressBar::no_length();
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(
+            ProgressStyle::with_template("{wide_msg:!} {percent:>3}% [{bar:25}] {bytes:>11} / {total_bytes:<11} {binary_bytes_per_sec:>13} ETA {eta_precise:8} ")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+
+        pb.set_message(format!("{}/{}", self.name, self.source.checksum()?));
+
+        let mut out_file = File::create(&self.tmp_file.path)?;
+
+        let mut handle = Easy::new();
+        handle.url(&self.source.url())?;
+        handle.progress(true)?;
+
+        let mut transfer = handle.transfer();
+
+        transfer.progress_function(|total, current, _, _| {
+            if total > 0.0 {
+                pb.set_length(total as u64);
+                pb.set_position(current as u64);
+            }
+
+            true
+        })?;
+
+        transfer.write_function(|data| {
+            out_file.write_all(data).unwrap();
+            Ok(data.len())
+        })?;
+
+        transfer.perform()?;
+
+        pb.finish();
+        Ok(())
+    }
+
+    pub fn send_to_cache(&self, cache: &Cache) -> Result<()> {
+        cache.cache_tmp_file(&self.tmp_file, self.source.checksum()?)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TempFile {
+    pub path: PathBuf,
+}
+
+impl TempFile {
+    pub fn new(root: &TetraRoot, hash: blake3::Hash) -> Result<Self> {
+        let mut path = root.get_temp_dir()?;
+        path.push(hash.to_string());
+
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if !self.path.is_file() {
+            return;
+        }
+
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            println!(
+                "WARN: Failed to remove temporary file {}, {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Cache {
+    pub cache_dir: PathBuf,
+}
+
+impl Cache {
+    pub fn get_cache_path(&self, hash: blake3::Hash) -> PathBuf {
+        let hash_str = hash.to_string();
+        let prefix = hash_str[0..2].to_string();
+
+        let mut path = self.cache_dir.join(prefix);
+        path.push(hash_str);
+
+        path
+    }
+
+    pub fn hash_file(path: &Path) -> Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_mmap(path)?;
+        Ok(hasher.finalize())
+    }
+
+    pub fn validate(&self, hash: blake3::Hash) -> Result<bool> {
+        let path = self.get_cache_path(hash);
+
+        if !path.is_file() {
+            return Ok(false);
+        }
+
+        let computed_hash = Self::hash_file(&path)?;
+        if hash != computed_hash {
+            // Hash did not match, cached file should be removed
+            std::fs::remove_file(path)?;
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    pub fn cache_tmp_file(&self, tmp_file: &TempFile, hash: blake3::Hash) -> Result<()> {
+        let prefix = hash.to_string()[0..2].to_string();
+        let cache_target_dir = self.cache_dir.join(prefix);
+
+        if !cache_target_dir.is_dir() {
+            std::fs::create_dir_all(&cache_target_dir)?;
+        }
+
+        let cache_path = self.get_cache_path(hash);
+        std::fs::rename(&tmp_file.path, cache_path)?;
+
+        if !self.validate(hash)? {
+            return Err(anyhow!("Temporary file checksum does not match {}", hash));
+        }
+
+        Ok(())
     }
 }
 
@@ -105,13 +285,19 @@ impl Repository {
         recipe_path.push(&package_id.name);
 
         if !recipe_path.is_dir() {
-            return Err(anyhow!("Package with name {} could not be found.", &package_id.name));
+            return Err(anyhow!(
+                "Package with name {} could not be found.",
+                &package_id.name
+            ));
         }
-        
+
         recipe_path.push(&package_id.version);
 
         if !recipe_path.is_dir() {
-            return Err(anyhow!("Package version {} does not exist.", &package_id.version));
+            return Err(anyhow!(
+                "Package version {} does not exist.",
+                &package_id.version
+            ));
         }
 
         for flavour in &package_id.flavours {
@@ -119,7 +305,9 @@ impl Repository {
         }
 
         if !recipe_path.is_dir() {
-            return Err(anyhow!("Specified package flavour combination does not exist."));
+            return Err(anyhow!(
+                "Specified package flavour combination does not exist."
+            ));
         }
 
         if let Some(arch) = &package_id.arch {
@@ -150,10 +338,30 @@ impl Repository {
     }
 }
 
+trait Checksum<T> {
+    fn checksum(&self) -> Result<T>;
+}
+
+trait Source: Checksum<blake3::Hash> {
+    fn url(&self) -> String;
+}
+
 #[derive(Debug, Deserialize)]
 struct RecipeSource {
     url: String,
     hash: String,
+}
+
+impl Checksum<blake3::Hash> for RecipeSource {
+    fn checksum(&self) -> Result<blake3::Hash> {
+        Ok(blake3::Hash::from_hex(&self.hash)?)
+    }
+}
+
+impl Source for RecipeSource {
+    fn url(&self) -> String {
+        self.url.clone()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -172,7 +380,7 @@ impl Recipe {
         let recipe_str = std::fs::read_to_string(path)?;
         let recipe: Self = serde_yaml::from_str(&recipe_str)?;
         Ok(recipe)
-    } 
+    }
 }
 
 #[derive(Debug)]
@@ -234,12 +442,19 @@ fn main() {
     let package_id = args[1].clone();
 
     let tetra_root = TetraRoot::new();
-
     println!("Tetra Root: {:#?}", tetra_root.root);
 
     let default_arch = tetra_root.get_default_arch();
-
     println!("Default architecture: {default_arch}");
+
+    let cache = match tetra_root.cache() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Failed to obtain cache object: {e}");
+            return;
+        }
+    };
+    println!("Cache directory: {:#?}", cache.cache_dir);
 
     let id = PackageId::from_str(package_id);
 
@@ -304,7 +519,37 @@ fn main() {
     println!("Sources:");
 
     for source in &recipe.sources {
-        println!("    - URL:{}", source.url);
+        println!("    - URL: {}", source.url);
         println!("      Hash: {}", source.hash);
+
+        let cache_path = cache.get_cache_path(source.checksum().unwrap());
+        println!("      Cache Path: {cache_path:#?}");
+
+        let validated = match cache.validate(source.checksum().unwrap()) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("Cache validation failed: {e}");
+                return;
+            }
+        };
+
+        if !validated {
+            let downloader = match Downloader::new(&tetra_root, source, &recipe.name) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("Error initializing downloader: {e}");
+                    return;
+                }
+            };
+
+            if let Err(e) = downloader.download() {
+                println!("Error while downloading: {e}");
+                return;
+            }
+
+            if let Err(e) = downloader.send_to_cache(&cache) {
+                println!("Caching failed: {e}");
+            };
+        }
     }
 }

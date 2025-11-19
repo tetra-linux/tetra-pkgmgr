@@ -9,5 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
+blake3 = { version = "1.8.2", features = [ "mmap" ] }
+curl = "0.4.49"
+indicatif = "0.18.3"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_yaml = "0.9.34"
