@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::model::PackageId;
+use crate::model::{Checksum, PackageId, Recipe, Source};
 
 #[derive(Debug)]
 struct TetraRoot {
@@ -339,51 +339,6 @@ impl Repository {
         }
 
         Err(anyhow!("Package recipe could not be found."))
-    }
-}
-
-trait Checksum<T> {
-    fn checksum(&self) -> Result<T>;
-}
-
-trait Source: Checksum<blake3::Hash> {
-    fn url(&self) -> String;
-}
-
-#[derive(Debug, Deserialize)]
-struct RecipeSource {
-    url: String,
-    hash: String,
-}
-
-impl Checksum<blake3::Hash> for RecipeSource {
-    fn checksum(&self) -> Result<blake3::Hash> {
-        Ok(blake3::Hash::from_hex(&self.hash)?)
-    }
-}
-
-impl Source for RecipeSource {
-    fn url(&self) -> String {
-        self.url.clone()
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct Recipe {
-    name: String,
-    version: String,
-    license: String,
-    maintainer: String,
-
-    #[serde(default)]
-    sources: Vec<RecipeSource>,
-}
-
-impl Recipe {
-    pub fn from_path(path: &Path) -> Result<Self> {
-        let recipe_str = std::fs::read_to_string(path)?;
-        let recipe: Self = serde_yaml::from_str(&recipe_str)?;
-        Ok(recipe)
     }
 }
 
