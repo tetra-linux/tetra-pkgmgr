@@ -1,3 +1,5 @@
+mod model;
+
 use anyhow::{Result, anyhow};
 use curl::easy::Easy;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -8,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
+use crate::model::PackageId;
 
 #[derive(Debug)]
 struct TetraRoot {
@@ -383,55 +387,6 @@ impl Recipe {
     }
 }
 
-#[derive(Debug)]
-struct PackageId {
-    pub repo: String,
-    pub name: String,
-    pub version: String,
-    pub flavours: Vec<String>,
-    pub arch: Option<String>,
-}
-
-impl PackageId {
-    pub fn from_str(s: String) -> Self {
-        let (rest, arch) = if let Some(pos) = s.rfind('#') {
-            (s[..pos].to_string(), Some(s[pos + 1..].to_string()))
-        } else {
-            (s, None)
-        };
-
-        let (repo, rest) = if let Some(pos) = rest.find('/') {
-            (rest[..pos].to_string(), rest[pos + 1..].to_string())
-        } else {
-            ("default".to_string(), rest)
-        };
-
-        let (name, rest) = if let Some(pos) = rest.find('@') {
-            (rest[..pos].to_string(), rest[pos + 1..].to_string())
-        } else if let Some(pos) = rest.find(':') {
-            // This handles the case where flavours are present, but no version
-            (
-                rest[..pos].to_string(),
-                format!("latest:{}", &rest[pos + 1..]),
-            )
-        } else {
-            (rest, "latest".to_string())
-        };
-
-        let mut parts = rest.split(':');
-        let version = parts.next().unwrap_or("latest").to_string();
-        let flavours = parts.map(|s| s.to_string()).collect::<Vec<_>>();
-
-        Self {
-            repo,
-            name,
-            version,
-            flavours,
-            arch,
-        }
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -456,7 +411,7 @@ fn main() {
     };
     println!("Cache directory: {:#?}", cache.cache_dir);
 
-    let id = PackageId::from_str(package_id);
+    let id = PackageId::from_id_str(package_id);
 
     println!("\nRepo: {}", id.repo);
     println!("Name: {}", id.name);
